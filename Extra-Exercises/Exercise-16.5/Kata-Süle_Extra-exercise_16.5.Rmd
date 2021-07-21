@@ -1,0 +1,226 @@
+---
+title: "Extra Exercise 16.5"
+author: "Kata Süle"
+date: '7th February 2021'
+output:
+  html_document:
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r, include=FALSE}
+# initialize packages -------------------------------------------------------------------
+library(Hmisc)
+library(tidyverse)
+library(caret)
+library(ranger)
+library(RColorBrewer)
+library(kableExtra)
+```
+
+```{r, include=FALSE}
+# import data and merge -------------------------------------------------------------
+data_f <- read_csv('C:/CEU/Winter_Term/Data_Analysis_3/da_data_repo/hotels-europe/clean/hotels-europe_features.csv')
+
+data_p <- read_csv('C:/CEU/Winter_Term/Data_Analysis_3/da_data_repo/hotels-europe/clean/hotels-europe_price.csv')
+
+# merge
+data <- merge(data_f, data_p)
+
+# filter for date
+num_obs <- data %>% group_by( year, month, weekend ) %>% summarise( n = n() ) %>% arrange( -n )
+
+# filter for 2018 April weekend because it has a lot of observations but still does not require too much computational power
+data <- data %>% filter( year == 2018 & month == 4 & weekend == 1)
+```
+
+## Aim
+
+This exercise is aimed at predicting hotel prices with a random forest model using the hotels-europe dataset.
+
+## Sample design and feature selection
+
+All prices were collected for a weekend in April 2018 in 31 European countries.
+
+I filtered variables that only had one outcome as well as Tripadvisor ratings, their counts and stars because more than a 1000 of them was missing. Furthermore, I filtered the alternative distance variable because I think distance from the city center was a more important feature. I created factor variables for all the countries and cities, the offer categories, the accommodation types and the scarce room variable. As for the offer categories I grouped the '75%+ offer' and '50%-75% offer' categories into one because they did have much less observations separately compared to the other categories. As for the accommodation type I only kept those categories which had more than 200 observations. I only kept observations whose price was below 1500 euros per night.
+
+The rating and rating count variables had missing values. I used the mean to impute the rating variable and the median to impute the rating count and added flags to mark these imputed values.
+
+```{r, include=FALSE}
+# feature selection -------------------------------------------------------
+
+# drop variables that have only one outcome and ones which I do not want to include in the model
+data <- data %>% select ( -c('year', 'month', 'weekend', 'nnights', 'holiday', 'city_actual', 'center1label', 'center2label', 'distance_alter'))
+
+# create 4 offer categories instead of 5 and turn it into a factor
+# make a factor for accommodation_type and keep only those categories which have more than 200 observations
+# create factor from cities and countries
+data <- data %>% mutate( offer_cat = ifelse( offer_cat == '75%+ offer', '50%+ offer', offer_cat),
+                         offer_cat = ifelse( offer_cat == '50%-75% offer', '50%+ offer', offer_cat),
+                         offer_cat = factor(offer_cat)) %>% 
+                filter(accommodation_type %in% c('Hotel','Apartment', 'Guest House', 'Pension', 'Bed and breakfast', 'Apart-hotel', 'Hostel')) %>% 
+                mutate(accommodation_type = factor(accommodation_type),
+                       city = factor(city),
+                       country = factor(country),
+                       scarce_room = factor(scarce_room))
+
+```
+
+```{r, include=FALSE}
+# label engineering -------------------------------------------------------
+
+describe(data$price)
+
+# histogram for price
+hist <- ggplot( data = data, aes(price) ) +
+  geom_histogram( fill = brewer.pal( 3, "Set2" )[1], alpha = 0.5 ) +
+  theme_bw() +
+  labs( x='\n Price', y='Absolute Frequency \n', title = 'Distribution of Price per Night') +
+  theme( panel.grid.minor.x = element_blank(), 
+         plot.title = element_text( size = 12, face = "bold", hjust = 0.5 ) )
+
+# drop observations where price is above 1500 euros per night
+data <- data %>% filter(price < 1500)
+```
+
+```{r, include=FALSE}
+# check missing values and duplicates ----------------------------------------------------
+
+# there are no duplicates
+sum(duplicated(data))
+
+# only the rating and rating count variables have missing values
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+
+# exclude ratingta, ratingta_count and stars because they have more than 1000 missing values
+data <- data %>% select(-c(stars, ratingta, ratingta_count))
+
+# impute missing ratings with mean
+# impute missing rating counts with median and add flags
+data <- data %>% mutate(rating_flag = ifelse(is.na(rating), 1, 0),
+  rating = ifelse(is.na(rating), mean(data$rating, na.rm = T), rating),
+  rating_reviewcount_flag = ifelse(is.na(rating_reviewcount), 1, 0),
+                        rating_reviewcount = ifelse(is.na(rating_reviewcount), median(data$rating_reviewcount, na.rm = T), rating_reviewcount))
+```
+
+## Modeling
+
+I created a training and a holdout sample which contained 70% and 30% of the observations respectively. I used 5-fold cross-validation to estimate random forest models with price as the target variable. I used 10 predictors for the estimation.
+
+The table below shows the cross-validated RMSE values for all the random forest models. The best model chose 5 variables randomly at each split for each tree and had 15 observations in the final nodes. Based on the cross-validated RMSE the best model makes an error of 97.76 euros in general. This model had an RMSE of 88.35 for the holdout sample. This means that the model makes an error of 88.35 euros in general.
+
+```{r, include=FALSE, cache=TRUE}
+# modeling ----------------------------------------------------------------
+
+# create holdout set
+set.seed(890)
+
+train_indices <- as.integer(createDataPartition(data$price, p = 0.7, list = FALSE))
+data_train <- data[train_indices, ]
+data_holdout <- data[-train_indices, ]
+
+# set the number of folds for cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              verboseIter = FALSE)
+
+# set tuning
+tune_grid <- expand.grid(
+    .mtry = c(2,3,5),
+    .splitrule = "variance",
+    .min.node.size = c( 5,10,15 )
+)
+
+# predictors
+vars_not_to_include <-  c('price', 'hotel_id', 'neighbourhood', 'offer')
+vars <- colnames(data)[!colnames(data) %in% vars_not_to_include]
+
+# run cart with low tuning parameters and all variables
+set.seed(7)
+system.time({
+    rf_model <- train(
+        formula(paste0("price ~", paste0(vars, collapse = " + "))),
+        data = data_train,
+        method = "ranger",
+        trControl = train_control,
+        tuneGrid = tune_grid,
+        importance = "impurity"
+    )
+})
+
+#check results
+cv_results_table <- rf_model$results %>% as.data.frame %>% select(c(mtry, min.node.size, RMSE))
+
+names(cv_results_table) <- c('Num. vars', 'Min. node size', 'CV RMSE')
+
+#evaluate model on the holdout set: 88.35
+data_holdout_w_prediction <- data_holdout %>%
+    mutate(predicted_price = predict(rf_model, newdata = data_holdout))
+
+holdout_rmse <- RMSE(data_holdout_w_prediction$predicted_price,data_holdout_w_prediction$price)
+```
+
+```{r}
+# print table
+knitr::kable( cv_results_table, caption = "Performance of random forest models", digits = 2 ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
+## Variable importance plots
+
+I created two variable importance plots. The first one shows only the top 10 cities as separate variables, while the second one shows the cities as a group.
+
+```{r}
+# create variable importance plots
+
+var_imp <- importance(rf_model$finalModel)/1000
+var_imp_df <-
+    data.frame(varname = names(var_imp),imp = var_imp) %>%
+    arrange(desc(imp)) %>%
+    mutate(imp_percentage = imp/sum(imp))
+
+cities <- subset(var_imp_df$varname, grepl('city', var_imp_df$varname))
+
+city_bin <- var_imp_df %>% filter( varname %in% cities)
+
+bin <- ggplot(city_bin[1:10,], aes(x=reorder(varname, imp), y=imp_percentage)) +
+    geom_point(colour="dodgerblue", size=1) +
+    geom_segment(aes(x=varname,xend=varname,y=0,yend=imp_percentage), colour="dodgerblue", size=0.75) +
+    ylab("Importance (Percent)") +
+    xlab("Variable Name") +
+  labs(title = 'Variable importance plot for cities as binary variables') +
+    coord_flip() +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=8), axis.text.y = element_text(size=8),
+          axis.title.x = element_text(size=8), axis.title.y = element_text(size=8))
+
+bin
+
+group_var_imp_df <- 
+var_imp_df %>%  
+    mutate(group = ifelse(varname %in% cities, 'city' ,varname)) %>%
+    group_by(group) %>% 
+    summarise(group_imp_sum = sum(imp_percentage))
+
+    
+grouped <- ggplot(group_var_imp_df[1:10,], aes(x=reorder(group, group_imp_sum), y=group_imp_sum)) +
+    geom_point(colour="deeppink4", size=1) +
+    geom_segment(aes(x=group,xend=group,y=0,yend=group_imp_sum), colour="deeppink4", size=0.75) +
+    ylab("Importance (Percent)") +
+    xlab("Variable Name") +
+    coord_flip() +
+  labs(title= 'Variable importance plot with cities as a group') +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(size=8), axis.text.y = element_text(size=8),
+          axis.title.x = element_text(size=8), axis.title.y = element_text(size=8))
+
+grouped
+
+```

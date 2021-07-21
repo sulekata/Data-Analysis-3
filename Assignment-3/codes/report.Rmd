@@ -1,0 +1,490 @@
+---
+title: "Best Hotels with Machine Learning"
+subtitle: "Data Analysis 3 - Assignment 3"
+author: "Kata Süle"
+date: '13th February 2021'
+output:
+  html_document:
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r, include=FALSE}
+# setup -------------------------------------------------------------------
+
+library(tidyverse)
+library(Hmisc)
+library(RColorBrewer)
+library(caret)
+library(rpart)
+library(kableExtra)
+
+color <- c(brewer.pal( 3, "Set2" )[1], brewer.pal( 3, "Set2" )[2], brewer.pal( 3, "Set2" )[3], brewer.pal( 3, "Set2" )[5])
+```
+
+# Executive Summary
+
+The purpose of this report is to find the best hotel deals in Vienna for a weekday in November 2017 by estimating an OLS, a CART and a Random Forest model. The dataset used for the analysis contains data on 416 hotels located in the city of Vienna. The target variable of the models is price per night per person while the predictors are different characteristics of the hotels such as location and rating. After finding the three best models by 5-fold cross-validation three lists are created ranking the top 5 hotel deals. There are two hotels that appear in exactly two of these lists and none which appear in all three of them.
+
+# Introduction
+
+Even though going on holiday has not been possible for the past months everybody hopes that this will change by next summer. In case these hopes come true many people will start looking for the best deals in terms of transportation as well as accommodation. This report focuses on the latter and aims to find the best accommodation deals for a single night in Vienna using data for a weekday in November 2017.
+
+# Data and Variables
+
+The dataset used for the analysis was collected from a booking site via web scraping and stems from the book ['Data Analysis for Business, Economics, and Policy'](https://gabors-data-analysis.com/) by Gábor Békés and Gábor Kézdi. It is a cross-section of 428 hotels available in Vienna on a weekday in November 2017. The dataset originally contains 23 variables which refer to different characteristics of the hotels such as price, location, number of stars or ratings. 
+
+### Sample Design
+
+When inspecting the city_actual variable which shows the actual city where the hotel is located I found 10 hotels which were not in Vienna but in close-by towns. Since these hotels were too far from the city centre of Vienna in general I decided to drop them from the dataset. As a result the dataset had 418 observations.
+
+```{r, include=FALSE}
+# import raw data -------------------------------------------------------------
+data <- read_csv('C:/CEU/Winter_Term/Data_Analysis_3/Assignment_3/data/raw/hotels-vienna.csv')
+
+# inspect variables -------------------------------------------------------
+
+## check variables that probably have no variation
+# all observations are for Austria
+table(data$country)
+
+# 418 hotels in Vienna, 10 elsewhere
+table(data$city_actual)
+# check those 10 observations which are not in Vienna
+not_vienna <- data %>% filter(city_actual != 'Vienna')
+# check the distribution of distance without those 10
+describe(data[data$city_actual == 'Vienna',]$distance)
+# drop these observations because they are too far from the city centre
+data <- data %>% filter(city_actual == 'Vienna')
+
+# all observations are for Vienna
+table(data$city)
+
+# center1label is city centre for all observations
+table(data$center1label)
+
+# center2label is Donauturm for all observations
+table(data$center2label)
+
+# year is 2017
+table(data$year)
+
+# month is 11
+table(data$month)
+
+# weekend is 0
+table(data$weekend)
+
+# holiday is 0
+table(data$holiday)
+
+# nnights is 1
+table(data$nnights)
+
+# drop variables which have no variation
+data <- data %>% mutate(
+  country = NULL,
+  city = NULL,
+  city_actual = NULL,
+  center1label = NULL,
+  center2label = NULL,
+  year = NULL,
+  month = NULL,
+  weekend = NULL,
+  holiday = NULL,
+  nnights = NULL
+)
+
+# check categorical variables and convert them to factor
+# there are 19 neighbourhoods
+table(data$neighbourhood)
+length(table(data$neighbourhood))
+
+# there are 5 offer categories, group the 50%-75% and 75%+ categories
+table(data$offer_cat)
+
+# there are 7 accommodation types, make 3 groups: apartment, hotel, other
+table(data$accommodation_type)
+
+# keep scarce room as is
+table(data$scarce_room)
+
+# check conditional means
+categoricals <- c("scarce_room", "neighbourhood", "offer_cat", "accommodation_type")
+
+for (i in 1:length(categoricals)) {
+  data %>%
+    group_by(get(categoricals[i])) %>%
+    summarise(mean_price = mean(price) ,  n=n()) %>%
+    print
+}
+
+# make changes and convert to factor
+data <- data %>% mutate( 
+        neighbourhood = factor(neighbourhood),
+        offer_cat = ifelse( offer_cat == '75%+ offer', '50%+ offer', offer_cat),
+        offer_cat = ifelse( offer_cat == '50%-75% offer', '50%+ offer', offer_cat),
+        offer_cat = factor(offer_cat),
+        accommodation_type = ifelse( accommodation_type == 'Apartment', 'apartment', 
+                                     ifelse( accommodation_type == 'Hotel', 'hotel', 'other')),
+        accommodation_type = factor(accommodation_type),
+        scarce_room = factor(scarce_room),
+        offer = factor(offer)
+        )
+
+# numerical variables
+# stars, rating are between 1 and 5
+describe(data$stars)
+describe(data$rating)
+
+# distance measures do not have extreme values
+# keep rating_count as is
+
+# check target variable: price
+describe(data$price)
+
+```
+
+### Label Engineering
+
+The target variable of the analysis is price per night per person since the aim is to find the best deals for a weekday night in Vienna. The histogram below shows the distribution of the price variable. As it is usually the case with price or income related variables it has a skewed distribution with a long right tail. Some values at the far right end of the distribution are extreme values which can make the predictions less accurate. Therefore, I decided to exclude them and keep hotels which had a price that was below 750 euros per night per person. This meant dropping two observations so the dataset had 416 hotels in the end. As for functional form I opted for using the level of price because the analysis focuses on finding the best deals in absolute terms.
+
+```{r}
+# histogram for price
+hist <- ggplot( data = data, aes(price) ) +
+  geom_histogram( fill = brewer.pal( 3, "Set2" )[1], alpha = 0.5 ) +
+  theme_bw() +
+  labs( x='\n Price', y='Absolute Frequency \n', title = 'Distribution of Price per Night') +
+  theme( panel.grid.minor.x = element_blank(), 
+         plot.title = element_text( size = 12, face = "bold", hjust = 0.5 ) )
+hist
+```
+
+### Feature Engineering
+
+Out of the 22 predictors 10 were dropped which did not have any variation such as country, city, year and month. From the remaining 12 the variables corresponding to TripAdvisor ratings and their counts were excluded because a quarter of their values was missing. The other rating and rating count variables (referring to the ratings on the booking site) had missing values but since the proportions of these was relatively small I decided to impute them. For rating I chose to impute missing values with the mean whereas for rating count I imputed with the median. In addition, I added flags to mark the imputed values.
+
+The predictors neighbourhood, scarce room, offer category and accommodation type were converted to factors since they are all categorical variables. The first two were left unchanged, however for the offer category I grouped the observations in the top two groups (the ones which had the highest discounts). The reason behind this was that the top one category barely had any observations. As for the accommodation type I chose to create three categories: hotel, apartment and other. The argument for this is that approximately 90% of the observations belong to the hotel or the apartment categories and the remaining six contained very few hotels separately.
+
+As the last step of feature engineering I inspected the pattern of association between numerical variables and the target variable to decide about their functional forms for the OLS model later on. I created loess plots for each numerical variable. The one for rating count can be seen below.
+
+```{r, include=FALSE}
+# drop observations where price is above 750 euros per night (there are 2 of these)
+data <- data %>% filter(price < 750)
+
+# missing values ----------------------------------------------------------
+
+# the ratings columns have missing values
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+
+# drop TripAdvisor ratings and their counts because a quarter of them is missing
+data <- data %>% mutate(
+  ratingta = NULL,
+  ratingta_count = NULL
+)
+
+# impute missing ratings with mean
+# impute missing rating counts with median
+# plus add flags for these observations
+data <- data %>% mutate( rating_flag = ifelse(is.na(rating), 1, 0),
+                         rating = ifelse(is.na(rating), mean(data$rating, na.rm = T), rating),
+                         rating_count_flag = ifelse(is.na(rating_count), 1, 0),
+                         rating_count = ifelse(is.na(rating_count), median(data$rating_count, na.rm = T), rating_count))
+```
+
+```{r, include=FALSE}
+# inspect functional forms for OLS ----------------------------------------
+
+num_vars <- c("rating_count", "stars", "distance", "distance_alter", "rating")
+ln_num_vars <- c("ln_rating_count", "ln_distance", "ln_distance_alter") 
+
+# create loess plots for level numerical variables
+plist = sapply(num_vars, function(col) {
+  ggplot(data, aes_string(x = col, y = "price")) + geom_smooth(method="loess", colour = color[1]) + geom_point() +
+    labs( x = paste0("\n", col), y = "price per night \n", title = paste0("Pattern of association between price and ", col)) +
+    theme( panel.grid.minor.x = element_blank(), 
+           plot.title = element_text( size = 12, face = "bold", hjust = 0.5 ) ) +
+    theme_bw()
+}, simplify=FALSE)
+
+plist[['rating']]
+
+# add logs and squares of numerical variables
+data <- data %>% mutate( ln_rating_count = log(rating_count), 
+                         stars_sq = stars^2,
+                         ln_distance = ifelse(distance == 0, log(0.01),log(distance)),
+                         ln_distance_alter = log(distance_alter),
+                         rating_sq = rating^2)
+
+# create loess plots for log numerical variables
+plist_ln = sapply(ln_num_vars, function(col) {
+  ggplot(data, aes_string(x = col, y = "price")) + geom_smooth(method="loess", colour = color[1]) + geom_point() +
+    labs( x = paste0("\n", col), y = "price per night \n", title = paste0("Pattern of association between price and ", col)) +
+    theme( panel.grid.minor.x = element_blank(), 
+           plot.title = element_text( size = 12, face = "bold", hjust = 0.5 ) ) +
+    theme_bw()
+}, simplify=FALSE)
+
+plist_ln[['ln_distance']]
+```
+
+```{r, out.width='50%'}
+plist[['rating_count']]
+plist_ln[['ln_rating_count']]
+```
+
+Based on these plots I decided to use the logarithmically transformed version of the rating count variable for model fitting. There were three other predictors where I decided to add the log or the square to the prediction: distance from the city centre (log), number of stars (square) and rating (square).
+
+# Modeling
+
+I estimated three types of models in total: OLS, CART and Random Forest. Before fitting the models I created predictor sets to make the estimation more seamless. Then I randomly split the data into two parts: a training set (with 80% of the observations) and a holdout set (with 20% of the observations). To estimate the models I used 5-fold cross-validation.
+
+### Predictor Sets
+
+I defined four predictor sets to estimate OLS models. The first one (ols_1) contained 8 predictors (all numeric ones in levels), plus 2 flag variables. The second one (ols_2) contained 10 predictors (logs and squares were added), plus the 2 flag variables. The third one (ols_3) extended ols_1 by adding two interactions: between scarce room and neighbourhood and between accommodation type and number of stars. The fourth one extended ols_2 by adding the previously mentioned two interactions. The predictor sets for CART and Random Forest were the same as ols_1.
+
+### Fitted Models
+
+Since I defined four predictor sets to estimate OLS models I fitted four OLS models. The cross-validated performance of the second model ran on the ols_2 predictor set proved to be best. Therefore I am going to report this in the final model comparison table.
+
+As for the CART model I set the number of observations in the final nodes to 20 and the complexity parameter to 0.001.
+
+The tuning parameters for the Random Forest were as follows: the grid for the number of observations in the final nodes was set to be either 5, 10 or 15, while the grid for the number of randomly chosen predictors at each split was set to be either 3, 4 or 5. The model with the highest cross-validated RMSE had 5 for both of the parameters.
+
+```{r, include=FALSE}
+# define predictor sets -----------------------------------------------
+
+ols_1 <- c("rating_count", "rating_count_flag", "neighbourhood", "stars", "scarce_room", "offer_cat", "distance", "accommodation_type", "rating", "rating_flag")
+ols_2 <- c("ln_rating_count", "rating_count_flag", "neighbourhood", "stars", "stars_sq", "scarce_room", "offer_cat", "ln_distance", "accommodation_type", "rating", "rating_sq", "rating_flag")
+ols_3 <- c("rating_count", "rating_count_flag", "neighbourhood", "stars", "scarce_room", "offer_cat", "distance", "accommodation_type", "rating", "rating_flag", "scarce_room * neighbourhood",  "accommodation_type * stars")
+ols_4 <- c("ln_rating_count", "rating_count_flag", "neighbourhood", "stars", "stars_sq", "scarce_room", "offer_cat", "ln_distance", "accommodation_type", "rating", "rating_sq", "rating_flag", "scarce_room * neighbourhood", "accommodation_type * stars")
+cart <- ols_1
+rf <- ols_1
+
+
+# modelling ---------------------------------------------------------------
+
+# create holdout set
+set.seed(890)
+
+train_indices <- as.integer(createDataPartition(data$price, p = 0.8, list = FALSE))
+df_train <- data[train_indices, ]
+df_holdout <- data[-train_indices, ]
+
+# set the number of folds for cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              verboseIter = FALSE)
+
+# OLS ---------------------------------------------------------------------
+
+# OLS 1
+set.seed(890)
+system.time({
+  ols_model1 <- train(
+    formula(paste0("price ~", paste0(ols_1, collapse = " + "))),
+    data = df_train,
+    method = "lm",
+    trControl = train_control
+  )
+})
+
+# OLS 2
+set.seed(890)
+system.time({
+  ols_model2 <- train(
+    formula(paste0("price ~", paste0(ols_2, collapse = " + "))),
+    data = df_train,
+    method = "lm",
+    trControl = train_control
+  )
+})
+
+# OLS 3
+set.seed(890)
+system.time({
+  ols_model3 <- train(
+    formula(paste0("price ~", paste0(ols_3, collapse = " + "))),
+    data = df_train,
+    method = "lm",
+    trControl = train_control
+  )
+})
+
+# OLS 4
+set.seed(890)
+system.time({
+  ols_model4 <- train(
+    formula(paste0("price ~", paste0(ols_4, collapse = " + "))),
+    data = df_train,
+    method = "lm",
+    trControl = train_control
+  )
+})
+
+
+# CART --------------------------------------------------------------------
+
+set.seed(890)
+system.time({
+  cart <- train(
+    formula(paste0("price ~", paste0(cart, collapse = " + "))),
+    data = df_train,
+    method = "rpart",
+    trControl = train_control,
+    control = rpart.control(minsplit = 20),
+    tuneGrid= expand.grid(cp = 0.001))
+})
+
+
+# Random Forest -----------------------------------------------------------
+
+tune_grid <- expand.grid(
+  .mtry = c( 3, 4, 5 ),
+  .splitrule = "variance",
+  .min.node.size = c(5, 10, 15)
+)
+
+set.seed(890)
+system.time({
+  rf_model <- train(
+    formula(paste0("price ~", paste0(rf, collapse = " + "))),
+    data = df_train,
+    method = "ranger",
+    trControl = train_control,
+    tuneGrid = tune_grid,
+    importance = "impurity"
+  )
+})
+
+# mtry = 5, min.node.size = 5
+rf_model$finalModel$mtry
+rf_model$finalModel$min.node.size
+
+# model selection ---------------------------------------------------------
+
+final_models <-
+  list("OLS 2" = ols_model2,
+       "CART" = cart,
+       "Random Forest" = rf_model)
+
+results <- resamples(final_models) %>% summary()
+
+# get average CV RMSE
+final_rmse <- imap(final_models, ~{
+  mean(results$values[[paste0(.y,"~RMSE")]])
+}) %>% unlist() %>% as.data.frame() %>%
+  rename("CV RMSE" = ".")
+
+# evaluate final models on holdout set
+final_holdout <- map(final_models, ~{
+  RMSE(predict(.x, newdata = df_holdout), df_holdout[["price"]])
+}) %>% unlist() %>% as.data.frame() %>%
+  rename("Holdout RMSE" = ".")
+
+final_combined <- cbind(final_rmse, final_holdout)
+```
+
+Below is a comparison table for the three best models. According to the average cross-validated RMSE the Random Forest model performs best then the CART and finally the OLS model. However, if we look at the RMSE values on the holdout set we can see that the best model is the OLS, followed very closely by the Random Forest and then the CART. This can strengthen the argument that complicated machine learning models do not necessarily have significantly better performance than more traditional models.
+
+```{r}
+# print table
+knitr::kable( final_combined, caption = "Model performance comparison", digits = 2 ) %>% kable_styling( position = "center", latex_options = 'hold_position')
+```
+
+# Best Deals
+
+In order to get the best deals for a weekday night in Vienna in November 2017 I reran the final three models on the entire original dataset to get the predicted price for each hotel. After this step I also calculated the differences between the actual and the predicted prices. Then I sorted the hotels in ascending order based on these differences. Below are three tables with the top 5 hotels according to the estimations of each model.
+
+```{r}
+# get top 5 deals ---------------------------------------------------------
+
+# estimate all 3 models for entire original data
+pred_ols_2 <- predict(ols_model2, data)
+pred_cart <- predict(cart, data)
+pred_rf <- predict(rf_model, data)
+
+# add fitted values to df
+data <- data %>% mutate(
+  pred_ols_2 = pred_ols_2,
+  pred_cart = pred_cart,
+  pred_rf = pred_rf
+)
+
+# calculate differences
+data <- data %>% mutate(
+  diff_ols_2 = price - pred_ols_2,
+  diff_cart = price - pred_cart,
+  diff_rf = price - pred_rf
+)
+
+# get top 5 best deals for OLS 2
+top_5_ols <- data %>% top_n( -5 , diff_ols_2 ) %>% 
+  select( hotel_id, price, diff_ols_2, distance, stars, rating ) %>% arrange( diff_ols_2 )
+
+names(top_5_ols) <- c("Hotel ID", "Price", "Residual", "Distance", "Stars", "Rating")
+top_5_ols <- as.data.frame(top_5_ols)
+
+# compare with chapter 10
+# none of the IDs match
+
+# print table
+top_5_ols$`Hotel ID` = cell_spec(top_5_ols$`Hotel ID`, color = ifelse(top_5_ols$`Hotel ID` == 22156, color[1], "black"))
+knitr::kable( top_5_ols, caption = "Five best deals with OLS 2", digits = 2, escape = F ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
+We can see that the top 5 hotels according to the OLS model have lower prices in general. However, they tend to be further from the city centre than the top 5 of the other two models. It is also interesting to mention that this is the only model out of the three which predicted a 1-star hotel to be in the top 5 as well as a hotel which has a rating of 1.
+
+```{r}
+# get top 5 best deals for CART
+top_5_cart <- data %>% top_n( -5 , diff_cart ) %>% 
+  select( hotel_id, price, diff_cart, distance, stars, rating ) %>% arrange( diff_cart )
+
+names(top_5_cart) <- c("Hotel ID", "Price", "Residual", "Distance", "Stars", "Rating")
+top_5_cart <- as.data.frame(top_5_cart)
+
+# compare with chapter 10
+# none of the IDs match
+
+# print table
+top_5_cart$`Hotel ID` = cell_spec(top_5_cart$`Hotel ID`, color = ifelse(top_5_cart$`Hotel ID` == 22156, color[1],ifelse(top_5_cart$`Hotel ID` == 22114, color[2], "black")))
+knitr::kable( top_5_cart, caption = "Five best deals with CART", digits = 2, escape = F ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
+By looking at the top 5 hotels according to the CART model we can say that all of them have 5 stars and their ratings are all above 4.
+
+```{r}
+# get top 5 best deals for random forest
+top_5_rf <- data %>% top_n( -5 , diff_rf) %>% 
+  select( hotel_id, price, diff_rf, distance, stars, rating ) %>% arrange( diff_rf )
+
+names(top_5_rf) <- c("Hotel ID", "Price", "Residual", "Distance", "Stars", "Rating")
+top_5_rf <- as.data.frame(top_5_rf)
+
+# compare with chapter 10
+# none of the IDs match
+
+# print table
+top_5_rf$`Hotel ID` = cell_spec(top_5_rf$`Hotel ID`, color = ifelse(top_5_rf$`Hotel ID` == 22114, color[2], "black"))
+knitr::kable( top_5_rf, caption = "Five best deals with Random Forest", digits = 2, escape = F ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
+As for the top 5 of the Random Forest model we can conclude that the differences between actual and predicted prices are the lowest here compared to the other two models. All of these hotels are located within 0.5 miles away from the city centre, have at least 3.5 stars and a rating of at least 3.98.
+
+If we look at the intersection of the three top 5 lists there is no hotel which appears in all of them. However, there are two which appear in two lists and these are highlighted  with different colours. Hotel 22156 is ranked first according to OLS and second according to CART. Hotel 22114 is ranked third according to CART and ranked fourth according to Random Forest. Apart from price and distance from the city centre these hotels have the same features. The lower price of Hotel 22156 could also be due to it being further from the city centre.
+
+When compared with the best deals found in Chapter 10 of the 'Data Analysis for Business, Economics, and Policy' book mentioned before there are no matches with either of the three lists. This could be due to the fact that the model estimated in Chapter 10 had fewer predictors than the models in this analysis.
+
+```{r, include=FALSE}
+# hotels that appear in all three top 5-s
+intersect(top_5_ols$`Hotel ID`, top_5_cart$`Hotel ID`)
+intersect(top_5_ols$`Hotel ID`, top_5_rf$`Hotel ID`)
+intersect(top_5_cart$`Hotel ID`, top_5_rf$`Hotel ID`)
+```
+

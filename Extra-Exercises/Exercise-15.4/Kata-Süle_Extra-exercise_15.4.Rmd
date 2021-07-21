@@ -1,0 +1,259 @@
+---
+title: "Extra Exercise 15.4"
+author: "Kata Süle"
+date: '7th February 2021'
+output:
+  html_document:
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r, include=FALSE}
+# initialize packages -------------------------------------------------------------------
+library(tidyverse)
+library(Hmisc)
+library(RColorBrewer)
+library(caret)
+library(rpart)
+library(fastDummies)
+library(kableExtra)
+```
+
+```{r, include=FALSE}
+# import data -------------------------------------------------------------
+data <- read_csv('C:/CEU/Winter_Term/Data_Analysis_3/da_data_repo/hotels-vienna/clean/hotels-vienna.csv')
+
+# all observations are for Austria for a weekday which is not a holiday and 1 night
+# distance is measured from the city center
+```
+
+## Aim
+
+This exercise is aimed at predicting hotel prices with a pruned regression tree using the hotels-vienna dataset.
+
+## Sample design and feature selection
+
+All prices were collected for a weekday in November 2017 in Vienna, Austria. I kept only those hotels whose actual location was Vienna and whose price was lower than 750 euros per night.
+
+I filtered variables that only had one outcome as well as Tripadvisor ratings and their counts because almost a third of them was missing. Furthermore, I filtered the alternative distance variable because I think distance from the city center was a more important feature. I created dummy variables for all the neighbourhoods, the offer categories and the accommodation types. As for the offer categories I grouped the '75%+ offer' and '50%-75% offer' categories into one because they did have much less observations separately compared to the other categories. As for the accommodation type I only kept those categories which had more than six observations.
+
+The rating and rating count variables had missing values. I used the mean to impute the rating variable and the median to impute the rating count and added flags for the imputed observations.
+
+```{r, include=FALSE}
+# feature selection -------------------------------------------------------
+
+# keep relevant variables
+# filter those that have only one outcome
+# plus filter tripadvisor ratings because they have 103 missing values
+# filter the alternative location because the city center matters
+data <- data %>% select ( -c('country', 'city', 'year', 'month', 'weekend', 'holiday', 'center1label',
+                     'center2label', 'distance_alter', 'nnights', 'ratingta', 'ratingta_count', 'scarce_room'))
+
+# keep places that are actually in Vienna
+# create 4 offer categories instead of 5 and turn it into a factor
+# make neighbourhood into a factor
+# make a factor for accommodation_type and keep only 4 categories which have more than 6 observations
+table(data$offer_cat)
+data <- data %>% filter( city_actual == 'Vienna') %>%
+                select( -city_actual) %>% 
+                mutate( offer_cat = ifelse( offer_cat == '75%+ offer', '50%+ offer', offer_cat),
+                         offer_cat = ifelse( offer_cat == '50%-75% offer', '50%+ offer', offer_cat),
+                         offer_cat = factor(offer_cat),
+                         neighbourhood = factor(neighbourhood)) %>% 
+                filter(accommodation_type %in% c('Hotel','Apartment', 'Guest House', 'Pension')) %>% 
+                mutate(accommodation_type = factor(accommodation_type))
+
+# create dummies for factor variables
+data <- dummy_columns(data, select_columns = c("neighbourhood", "offer_cat", "accommodation_type"))
+
+# rename three neighbourhood dummy
+data <- data %>% mutate( neighbourhood_17_Hernals = `neighbourhood_17. Hernals`,
+                         neighbourhood_Innere_Stadt = `neighbourhood_Innere Stadt`,
+                         neighbourhood_Kaertner_Strasse  = `neighbourhood_Kaerntner Strasse`,
+                         neighbourhood_Rudolfsheim = `neighbourhood_Rudolfsheim-Funfhaus`) %>%
+  select( -c(`neighbourhood_17. Hernals`, `neighbourhood_Innere Stadt`, `neighbourhood_Kaerntner Strasse`, `neighbourhood_Rudolfsheim-Funfhaus` ))
+
+# rename offer category dummies
+data <- data %>% mutate( no_offer = `offer_cat_0% no offer`,
+                         offer_1_15 = `offer_cat_1-15% offer`,
+                         offer_15_50 = `offer_cat_15-50% offer`,
+                         offer_50_ = `offer_cat_50%+ offer`) %>% 
+  select( -c( `offer_cat_0% no offer`, `offer_cat_1-15% offer`, `offer_cat_15-50% offer`, `offer_cat_50%+ offer`))
+
+# rename 1 accommodation type dummy
+data <- data %>% mutate( accommodation_type_Guest_House = `accommodation_type_Guest House`) %>% select( -`accommodation_type_Guest House`)
+```
+
+```{r, include=FALSE}
+# label engineering -------------------------------------------------------
+
+describe(data$price)
+
+# histogram for price
+hist <- ggplot( data = data, aes(price) ) +
+  geom_histogram( fill = brewer.pal( 3, "Set2" )[1], alpha = 0.5 ) +
+  theme_bw() +
+  labs( x='\n Price', y='Absolute Frequency \n', title = 'Distribution of Price per Night') +
+  theme( panel.grid.minor.x = element_blank(), 
+         plot.title = element_text( size = 12, face = "bold", hjust = 0.5 ) )
+
+# drop observations where price is above 750 euros per night
+data <- data %>% filter(price < 750)
+```
+
+```{r, include=FALSE}
+# check missing values and duplicates ----------------------------------------------------
+
+# there are no duplicates
+unique(data)
+
+# only the rating and rating count variables have missing values
+to_filter <- sapply(data, function(x) sum(is.na(x)))
+to_filter[to_filter > 0]
+
+# impute missing ratings with mean
+# impute missing rating counts with median
+data <- data %>% mutate( rating_flag = ifelse(is.na(rating), 1, 0),
+  rating = ifelse(is.na(rating), mean(data$rating, na.rm = T), rating),
+  rating_count_flag = ifelse(is.na(rating_count), 1, 0),
+                        rating_count = ifelse(is.na(rating_count), median(data$rating_count, na.rm = T), rating_count))
+
+```
+
+## Modeling
+
+I created a training and a holdout sample which contained 80% and 20% of the observations respectively. I used 5-fold cross-validation to estimate large regression trees with price as the target variable and then pruned them. For the first estimation I used 32 predictors, while for the second one I used only 13. The large difference between the number of predictors was due to not including the neighbourhood dummies for the second model.
+
+The table below shows the cross-validated and holdout RMSE values for the two trees. Furthermore, it also shows the holdout RMSE for the two pruned trees. The pruned trees have a much better performance than the original trees. It is also visible that the first pruned tree which was created from the model with more predictors had a lower RMSE for the holdout sample.
+
+```{r, include=FALSE}
+# modeling ----------------------------------------------------------------
+
+# create holdout set
+set.seed(890)
+
+train_indices <- as.integer(createDataPartition(data$price, p = 0.8, list = FALSE))
+data_train <- data[train_indices, ]
+data_holdout <- data[-train_indices, ]
+
+# set the number of folds for cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 5,
+                              verboseIter = FALSE)
+
+# predictors
+vars_not_to_include <-  c('price', 'hotel_id', 'neighbourhood', 'offer_cat', 'offer', 'accommodation_type')
+vars <- colnames(data)[!colnames(data) %in% vars_not_to_include]
+
+# run cart with low tuning parameters and all variables
+set.seed(7)
+system.time({
+  cart <- train(
+    formula(paste0("price ~", paste0(vars, collapse = " + "))),
+    data = data_train,
+    method = "rpart",
+    trControl = train_control,
+    control = rpart.control(minsplit = 5),
+    tuneGrid= expand.grid(cp = 0.0001))
+})
+
+# prune back the tree
+pfit <-prune(cart$finalModel, cp=0.005 )
+
+# getting average RMSE on test sets
+# test_ind <- cart$control$indexOut
+# data_train <- data[train_indices, ]
+
+# getting holdout RMSE
+pred_cart <- predict(pfit, data_holdout)
+rmse_cart <- sqrt(mean((pred_cart - data_holdout$price)^2))
+rmse_cart
+
+# exclude neighbourhood from predictors
+vars_not_to_include2 <-  c('price', 'hotel_id', 'neighbourhood', 'offer_cat', 'offer', 'accommodation_type')
+vars2 <- colnames(data)[!grepl("neighbourhood", colnames(data))]
+vars2 <- vars2[!vars2 %in% vars_not_to_include2]
+
+# run cart with low tuning parameters
+set.seed(7)
+system.time({
+  cart2 <- train(
+    formula(paste0("price ~", paste0(vars2, collapse = " + "))),
+    data = data_train,
+    method = "rpart",
+    trControl = train_control,
+    control = rpart.control(minsplit = 5),
+    tuneGrid= expand.grid(cp = 0.0001))
+})
+
+
+# prune back the tree
+pfit2 <-prune(cart2$finalModel, cp=0.005 )
+
+# getting holdout RMSE
+pred_cart2 <- predict(pfit2, data_holdout)
+rmse_cart2 <- sqrt(mean((pred_cart2 - data_holdout$price)^2))
+rmse_cart2
+
+# get CV and holdout RMSE for original trees
+final_models <-
+  list("CART 1 (all predictors)" = cart,
+       "CART 2 (without neighbourhood)" = cart2)
+
+results <- resamples(final_models) %>% summary()
+
+final_rmse <- imap(final_models, ~{
+  mean(results$values[[paste0(.y,"~RMSE")]])
+}) %>% unlist() %>% as.data.frame() %>%
+  rename("CV RMSE" = ".")
+
+final_holdout <- map(final_models, ~{
+  RMSE(predict(.x, newdata = data_holdout), data_holdout[["price"]])
+}) %>% unlist() %>% as.data.frame() %>%
+  rename("Holdout RMSE" = ".")
+
+final_combined <- cbind(final_rmse, final_holdout)
+
+# add holdout RMSE for pruned trees
+final_combined <- rbind(final_combined, "Pruned 1" = c('-', rmse_cart))
+
+final_combined <- rbind(final_combined, "Pruned 2" = c('-', rmse_cart2))
+```
+
+```{r}
+# print table
+knitr::kable( final_combined, caption = "Performance of trees", digits = 2 ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
+## Best Deals
+
+I used the first pruned tree to estimate prices for all the hotels in the entire original data to find the best five deals. These hotels can be seen in the table below. When comparing my results with those included in Chapter 10 I had to conclude that they did not overlap at all.
+
+```{r}
+# estimate best pruned tree for entire original data
+pred_all <- predict(pfit, data)
+
+# add fitted values to df
+data$pred <- pred_all
+
+# calculate differences
+data$diff <- data$price - data$pred
+
+# get top 5 best deals
+top_5 <- data %>% top_n( -5 , diff ) %>% 
+  select( hotel_id, price, diff, distance, stars, rating ) %>% arrange( diff )
+
+names(top_5) <- c("Hotel ID", "Price", "Residual", "Distance", "Stars", "Rating")
+
+# compare with chapter 10
+# none of the IDs match
+
+# print table
+knitr::kable( top_5, caption = "Five best deals", digits = 2 ) %>% kable_styling( position = "center", latex_options = 'hold_position' )
+```
+
